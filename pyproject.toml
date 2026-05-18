@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wxalerts-polar-reader"
+version = "0.1.0"
+description = "rio-tiler BaseReader for nexrad-proc-v4 polar Zarr v3 volumes"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "numpy~=2.1",
+    "zarr~=3.0",
+    "rio-tiler~=7.0",
+    "rasterio~=1.4",
+    "pyproj~=3.7",
+    "s3fs~=2024.10",
+    "structlog~=24.4",
+    "attrs~=24.2",
+    "mercantile~=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=8.3",
+    "pytest-cov~=5.0",
+    "pytest-mock~=3.14",
+    "moto[s3]~=5.0",
+    "pillow~=11.0",
+    "ruff~=0.7",
+    "mypy~=1.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polar_reader"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=polar_reader --cov-report=term-missing"
