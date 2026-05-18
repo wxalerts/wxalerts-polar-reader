@@ -20,15 +20,19 @@ from polar_reader._config import (
     DEFAULT_MINZOOM,
     DEFAULT_MAXZOOM,
 )
+from polar_reader import projection
 from polar_reader.colormaps import COLORMAPS
+from polar_reader.constants import ON_THE_FLY_ZOOM_THRESHOLD
 from polar_reader.exceptions import (
     ProductNotAvailable,
     SchemaVersionMismatch,
+    SiteNotFoundError,
     TileOutsideCoverage,
     TiltNotFound,
 )
 from polar_reader.lut import LutCache
-from polar_reader.products import PRODUCTS, get_product
+from polar_reader.products import PRODUCTS, Product, get_product
+from polar_reader.site_registry import SITE_GEOMETRY
 
 log = logging.getLogger(__name__)
 
@@ -161,6 +165,154 @@ class PolarRadarReader(BaseReader):
 
         raise TiltNotFound(f"Cannot parse tilt selector: {tilt!r}")
 
+    @staticmethod
+    def _read_zarr_product_attrs(
+        tilt_group: zarr.Group, product_obj: Product, tilt_name: str
+    ) -> tuple[zarr.Array, float, float, int]:
+        """Validate product availability and read scale/offset attrs."""
+        if product_obj.zarr_key not in tilt_group:
+            available = list(tilt_group.array_keys())
+            raise ProductNotAvailable(
+                f"Product '{product_obj.name}' not in {tilt_name}. Available: {available}"
+            )
+        product_arr: zarr.Array = tilt_group[product_obj.zarr_key]  # type: ignore[assignment]
+        prod_attrs = dict(product_arr.attrs)
+        scale_factor = float(prod_attrs.get("scale_factor", product_obj.scale))  # type: ignore[arg-type]
+        add_offset = float(prod_attrs.get("add_offset", product_obj.offset))  # type: ignore[arg-type]
+        fill_value = int(prod_attrs.get("_FillValue", product_obj.fill_value))  # type: ignore[arg-type]
+        return product_arr, scale_factor, add_offset, fill_value
+
+    @staticmethod
+    def _decode_values(
+        raw: np.ndarray,
+        coverage_mask: np.ndarray,
+        product_obj: Product,
+        scale_factor: float,
+        add_offset: float,
+        fill_value: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply NEXRAD ICD sentinel logic and scale/offset to raw array.
+
+        Returns (physical float32, output_mask uint8) where output_mask
+        follows the rio-tiler convention: 255 = valid, 0 = no data.
+        """
+        if product_obj.dtype == "uint8":
+            sentinel_mask = (raw == fill_value) | (raw == 255)
+        else:
+            sentinel_mask = raw == fill_value
+        valid_data = (~sentinel_mask) & (coverage_mask > 0)
+        physical = raw.astype(np.float32) * scale_factor + add_offset
+        output_mask = (valid_data * 255).astype(np.uint8)
+        return physical, output_mask
+
+    def _render_tile_lut(
+        self,
+        tile: mercantile.Tile,
+        product: str,
+        tilt_group: zarr.Group,
+        tilt_name: str,
+    ) -> ImageData:
+        """Render a tile using the pre-generated LUT (z <= 14 path)."""
+        lut_entry = self.lut_cache.lookup_tile(self.site_id, tile.z, tile.x, tile.y)
+        if lut_entry is None or lut_entry.mask.sum() == 0:
+            raise TileOutsideCoverage(
+                f"Tile z{tile.z}/{tile.x}/{tile.y} not in coverage for {self.site_id}"
+            )
+
+        product_obj = get_product(product)
+        product_arr, scale_factor, add_offset, fill_value = self._read_zarr_product_attrs(
+            tilt_group, product_obj, tilt_name
+        )
+
+        # Load the full array and fancy-index — cheaper than per-chunk zarr reads
+        full_array = np.array(product_arr)
+        raw = full_array[lut_entry.azimuth_idx, lut_entry.range_idx]
+
+        physical, output_mask = self._decode_values(
+            raw, lut_entry.mask, product_obj, scale_factor, add_offset, fill_value
+        )
+
+        bbox = mercantile.xy_bounds(tile.x, tile.y, tile.z)
+        return ImageData(
+            np.expand_dims(physical, 0),
+            output_mask,
+            assets=[self.input],
+            crs=CRS.from_epsg(3857),
+            bounds=(bbox.left, bbox.bottom, bbox.right, bbox.top),
+            band_names=[product],
+            metadata={
+                "site_id": self.site_id,
+                "scan_time_utc": self.scan_time_utc.isoformat(),
+                "vcp": self.vcp,
+                "tilt": tilt_name,
+                "elevation_deg": self._tilt_elevations[tilt_name],
+                "product": product,
+                "units": product_obj.units,
+            },
+        )
+
+    def _render_tile_on_the_fly(
+        self,
+        tile: mercantile.Tile,
+        product: str,
+        tilt_group: zarr.Group,
+        tilt_name: str,
+    ) -> ImageData:
+        """Render a tile via on-the-fly polar projection (z >= 15 path)."""
+        site_geom = SITE_GEOMETRY.get(self.site_id)
+        if site_geom is None:
+            raise SiteNotFoundError(
+                f"Site '{self.site_id}' not in site registry; cannot render on-the-fly"
+            )
+
+        product_obj = get_product(product)
+        product_arr, scale_factor, add_offset, fill_value = self._read_zarr_product_attrs(
+            tilt_group, product_obj, tilt_name
+        )
+
+        lon_arr, lat_arr = projection.tile_pixel_lonlat(tile)
+        range_idx, azimuth_idx, mask = projection.pixel_to_polar(
+            site_geom.lat,
+            site_geom.lon,
+            site_geom.first_range_gate_m,
+            site_geom.range_gate_spacing_m,
+            site_geom.max_range_m,
+            site_geom.n_azimuths,
+            lat_arr,
+            lon_arr,
+        )
+
+        if mask.sum() == 0:
+            raise TileOutsideCoverage(
+                f"Tile z{tile.z}/{tile.x}/{tile.y} not in coverage for {self.site_id}"
+            )
+
+        full_array = np.array(product_arr)
+        raw = full_array[azimuth_idx, range_idx]
+
+        physical, output_mask = self._decode_values(
+            raw, mask, product_obj, scale_factor, add_offset, fill_value
+        )
+
+        bbox = mercantile.xy_bounds(tile.x, tile.y, tile.z)
+        return ImageData(
+            np.expand_dims(physical, 0),
+            output_mask,
+            assets=[self.input],
+            crs=CRS.from_epsg(3857),
+            bounds=(bbox.left, bbox.bottom, bbox.right, bbox.top),
+            band_names=[product],
+            metadata={
+                "site_id": self.site_id,
+                "scan_time_utc": self.scan_time_utc.isoformat(),
+                "vcp": self.vcp,
+                "tilt": tilt_name,
+                "elevation_deg": self._tilt_elevations[tilt_name],
+                "product": product,
+                "units": product_obj.units,
+            },
+        )
+
     def tile(
         self,
         tile_x: int,
@@ -180,6 +332,10 @@ class PolarRadarReader(BaseReader):
         - bounds: Mercator bbox
         - crs: EPSG:3857
 
+        Zoom dispatch:
+        - z < ON_THE_FLY_ZOOM_THRESHOLD  → LUT-backed path
+        - z >= ON_THE_FLY_ZOOM_THRESHOLD → on-the-fly polar projection
+
         The colormap parameter is accepted for API compatibility but is NOT
         applied here — rio-tiler / TiTiler apply it at the endpoint layer.
         """
@@ -188,64 +344,14 @@ class PolarRadarReader(BaseReader):
                 f"Zoom {tile_z} outside reader range [{self.minzoom}, {self.maxzoom}]"
             )
 
-        lut_entry = self.lut_cache.lookup_tile(self.site_id, tile_z, tile_x, tile_y)
-        if lut_entry is None or lut_entry.mask.sum() == 0:
-            raise TileOutsideCoverage(
-                f"Tile z{tile_z}/{tile_x}/{tile_y} not in coverage for {self.site_id}"
-            )
-
         tilt_name = self._resolve_tilt(tilt)
-        tilt_group = self._zarr_root[tilt_name]
+        tilt_group: zarr.Group = self._zarr_root[tilt_name]  # type: ignore[assignment]
+        t = mercantile.Tile(tile_x, tile_y, tile_z)
 
-        product_obj = get_product(product)
-        if product_obj.zarr_key not in tilt_group:
-            available = list(tilt_group.array_keys())
-            raise ProductNotAvailable(
-                f"Product '{product}' not in {tilt_name}. Available: {available}"
-            )
-
-        product_arr = tilt_group[product_obj.zarr_key]
-        prod_attrs = dict(product_arr.attrs)
-
-        scale_factor = float(prod_attrs.get("scale_factor", product_obj.scale))
-        add_offset = float(prod_attrs.get("add_offset", product_obj.offset))
-        fill_value = int(prod_attrs.get("_FillValue", product_obj.fill_value))
-
-        # Load the full array and fancy-index — cheaper than per-chunk zarr reads
-        full_array = np.array(product_arr)
-        raw = full_array[lut_entry.azimuth_idx, lut_entry.range_idx]
-
-        # NEXRAD ICD sentinel handling:
-        #   uint8 raw 0 = below-threshold / no echo; raw 255 = range-folded / no data
-        #   int16 fill_value = -32768 = missing
-        if product_obj.dtype == "uint8":
-            sentinel_mask = (raw == fill_value) | (raw == 255)
+        if tile_z >= ON_THE_FLY_ZOOM_THRESHOLD:
+            return self._render_tile_on_the_fly(t, product, tilt_group, tilt_name)
         else:
-            sentinel_mask = raw == fill_value
-        valid_data = (~sentinel_mask) & (lut_entry.mask > 0)
-
-        physical = raw.astype(np.float32) * scale_factor + add_offset
-        # rio-tiler mask convention: 255 = valid, 0 = no data
-        output_mask = (valid_data * 255).astype(np.uint8)
-
-        bbox = mercantile.xy_bounds(tile_x, tile_y, tile_z)
-        return ImageData(
-            np.expand_dims(physical, 0),
-            output_mask,
-            assets=[self.input],
-            crs=CRS.from_epsg(3857),
-            bounds=(bbox.left, bbox.bottom, bbox.right, bbox.top),
-            band_names=[product],
-            metadata={
-                "site_id": self.site_id,
-                "scan_time_utc": self.scan_time_utc.isoformat(),
-                "vcp": self.vcp,
-                "tilt": tilt_name,
-                "elevation_deg": self._tilt_elevations[tilt_name],
-                "product": product,
-                "units": product_obj.units,
-            },
-        )
+            return self._render_tile_lut(t, product, tilt_group, tilt_name)
 
     def info(self) -> dict:  # type: ignore[override]
         """Metadata for the /info endpoint."""

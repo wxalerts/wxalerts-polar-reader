@@ -1,3 +1,6 @@
+import os
+
+import mercantile
 import pytest
 import numpy as np
 
@@ -9,6 +12,9 @@ from polar_reader.exceptions import (
     ProductNotAvailable,
     TiltNotFound,
 )
+
+_POLAR_ZARR_URI = os.environ.get("POLAR_ZARR_URI", "")
+_skip_no_zarr = pytest.mark.skipif(not _POLAR_ZARR_URI, reason="POLAR_ZARR_URI not set")
 
 
 def test_reader_opens_and_reads_attrs(sample_zarr_path, sample_lut_dir):
@@ -111,3 +117,51 @@ def test_reader_velocity_product(sample_zarr_path, sample_lut_dir):
     image = reader.tile(10, 20, 10, product="velocity", tilt="base")
     assert image.data.shape == (1, 256, 256)
     assert image.band_names == ["velocity"]
+
+
+# ── zoom-tier dispatch tests ───────────────────────────────────────────────────
+
+@pytest.mark.parametrize("tile_z", [10])
+def test_reader_renders_in_coverage_tile_lut_zooms(tile_z, sample_zarr_path, sample_lut_dir):
+    """LUT path renders correctly at z=10 (the fixture's supported zoom)."""
+    reader = PolarRadarReader(input=sample_zarr_path, lut_cache=LutCache(sample_lut_dir))
+    image = reader.tile(10, 20, tile_z, product="reflectivity", tilt="base")
+    assert image.data.shape == (1, 256, 256)
+    assert image.mask.shape == (256, 256)
+    valid_pixels = image.data[0][image.mask > 0]
+    assert valid_pixels.size > 0
+    np.testing.assert_allclose(valid_pixels.mean(), 32.0, atol=0.1)
+
+
+@_skip_no_zarr
+def test_render_tile_dispatches_on_the_fly_at_z15(tmp_path):
+    """Smoke test: z=15 dispatch reaches _render_tile_on_the_fly and returns ImageData."""
+    reader = PolarRadarReader(
+        input=_POLAR_ZARR_URI,
+        lut_cache=LutCache(str(tmp_path)),  # LUT not used at z>=15
+    )
+    # Find a tile ~50 km north of the site, well within 230 km coverage
+    tile = mercantile.tile(reader.site_lon, reader.site_lat + 0.4, 15)
+    image = reader.tile(tile.x, tile.y, 15, product="reflectivity", tilt="base")
+    assert image.data.shape == (1, 256, 256)
+    assert image.mask.shape == (256, 256)
+    assert image.count == 1
+
+
+@_skip_no_zarr
+def test_render_tile_dispatches_lut_at_z14(mocker, tmp_path):
+    """z=14 dispatch must call _render_tile_lut, not _render_tile_on_the_fly."""
+    reader = PolarRadarReader(
+        input=_POLAR_ZARR_URI,
+        lut_cache=LutCache(str(tmp_path)),
+    )
+    # Patch the private method so it returns a minimal ImageData without needing LUT files
+    dummy_image = mocker.MagicMock()
+    mock_lut = mocker.patch.object(reader, "_render_tile_lut", return_value=dummy_image)
+    mock_otf = mocker.patch.object(reader, "_render_tile_on_the_fly")
+
+    tile = mercantile.tile(reader.site_lon, reader.site_lat, 14)
+    reader.tile(tile.x, tile.y, 14, product="reflectivity", tilt="base")
+
+    mock_lut.assert_called_once()
+    mock_otf.assert_not_called()

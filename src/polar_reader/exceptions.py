@@ -20,3 +20,7 @@ class LutNotFound(PolarReaderError):
 
 class SchemaVersionMismatch(PolarReaderError):
     """The polar.zarr's schema_version is not supported by this reader."""
+
+
+class SiteNotFoundError(PolarReaderError):
+    """The requested site ID is not in the site registry."""
